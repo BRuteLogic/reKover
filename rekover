@@ -9,7 +9,7 @@
 # CONFIG & ARGUMENTS
 # ---------------------------------------------------------------------------
 
-TOOL="rekover.sh v1.0 by Brute Logic - https://brutelogic.net"
+TOOL="rekover.sh v1.1 by Brute Logic - https://brutelogic.net"
 TARGET=""
 JSON_MODE=false
 
@@ -31,6 +31,7 @@ WAF_TRIGGERED=false
 # Result storage
 declare -A RESULTS     # url → status code (all confirmed hits)
 declare -A SEEN        # url → 1 (visited URLs, dedup for crawl)
+declare -A QUEUED
 
 # UA pool
 UA_LIST=(
@@ -352,11 +353,13 @@ crawl() {
         	[[ "$line" == http* ]] && full="$line" || full="${TARGET}${line}"
         	[[ "$full" != "$TARGET"* ]] && continue
     		[[ "$full" =~ \.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|mp4|mp3)(\?.*)?$ ]] && continue
-        	[[ "${SEEN[$full]+x}" ]] && continue
-        	next+=("$full")
+                [[ "${SEEN[$full]+x}" ]] && continue
+		[[ "${QUEUED[$full]+x}" ]] && continue
+		QUEUED["$full"]=1
+		next+=("$full")
     	    fi
 	done < <(printf '%s\n' "${current[@]}" | $cmd probe {})
-        current=("${next[@]}")
+	current=("${next[@]}")
     done
 }
 
