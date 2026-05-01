@@ -6,6 +6,8 @@ Stealth hybrid URL mapper by [Brute Logic](https://brutelogic.net).
 
 Part of the **King of Noobs** suite — offensive recon tools built on KISS and the Pareto principle. Simple, fast, and effective.
 
+![demo](rekover-demo.gif)
+
 ---
 
 ## What It Does
