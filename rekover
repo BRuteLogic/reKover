@@ -9,7 +9,7 @@
 # CONFIG & ARGUMENTS
 # ---------------------------------------------------------------------------
 
-TOOL="rekover.sh v1.1 by Brute Logic - https://brutelogic.net"
+TOOL="reKover v1.2 by Brute Logic - https://brutelogic.net"
 TARGET=""
 JSON_MODE=false
 
@@ -27,6 +27,11 @@ PARALLEL_JOBS=50
 
 # WAF state
 WAF_TRIGGERED=false
+
+# Wayback
+WAYBACK_CAP=50                 # max signatures kept per archive pass
+WAYBACK_TMP="$(mktemp)"        # archive fetch lands here (background job)
+trap 'rm -f "$WAYBACK_TMP"' EXIT
 
 # Result storage
 declare -A RESULTS     # url → status code (all confirmed hits)
@@ -236,6 +241,45 @@ json_output() {
 }
 
 # ---------------------------------------------------------------------------
+# SIGNATURES & RANKING
+# ---------------------------------------------------------------------------
+
+# Normalize a URL/path to a dedup signature: path + sorted param keys (values dropped)
+sig() {
+	local u="$1" path query keys=""
+	if [[ "$u" == http*://* ]]; then
+		u="${u#http*://}"                       # drop scheme + host:port
+		if [[ "$u" == */* ]]; then u="/${u#*/}"; else u="/"; fi
+	fi
+	[[ "$u" != /* ]] && u="/$u"                     # leading slash for bare relatives
+	path="${u%%\?*}"; path="${path%/}"
+	[[ -z "$path" ]] && path="/"
+	if [[ "$u" == *\?* ]]; then
+		query="${u#*\?}"
+		keys=$(printf '%s' "$query" | tr '&' '\n' | sed 's/=.*//' | grep -v '^$' | sort -u | paste -sd,)
+	fi
+	printf '%s::%s\n' "$path" "$keys"
+}
+
+# Keep the vital few from weighted lines "count<TAB>payload" on stdin: walk the
+# ranking until cumulative count hits 80% of total, hard-capped at ceiling (arg 1)
+pareto_cut() {
+	local ceiling="$1"
+	sort -t$'\t' -k1,1 -nr | awk -F'\t' -v cap="$ceiling" '
+		{ w[NR]=$1; p[NR]=$2; total+=$1 }
+		END {
+			thresh = total * 0.8
+			acc = 0; kept = 0
+			for (i=1; i<=NR; i++) {
+				if (kept >= cap) break
+				print p[i]
+				acc += w[i]; kept++
+				if (acc >= thresh) break
+			}
+		}'
+}
+
+# ---------------------------------------------------------------------------
 # PREFLIGHT — reachability
 # ---------------------------------------------------------------------------
 
@@ -304,6 +348,18 @@ parse_body() {
 }
 export -f parse_body
 
+# JS-aware extraction: same-origin paths parse_body misses in script bodies
+# (relative api paths, fetch/axios args, backtick template literals)
+parse_js() {
+	local body="$1"
+	{
+		echo "$body" | grep -oE "[\"'](api|v[0-9]+|rest|graphql|internal)/[a-zA-Z0-9/_.-]+[\"']" | tr -d "\"'"
+		echo "$body" | grep -oE "(fetch|\.get|\.post|\.open)\(\s*[\"'][^\"']+[\"']" | grep -oE "[\"'][^\"']+[\"']" | tr -d "\"'"
+		echo "$body" | grep -oE '`[^`]*`' | sed -E "s/\\\$\{[^}]*\}.*//; s/\`//g" | grep -E '^/?[a-zA-Z0-9][a-zA-Z0-9/_.-]*/'
+	} | grep -vE '^https?:' | sed -E 's#^/*#/#' | sort -u
+}
+export -f parse_js
+
 probe() {
     local url="$1"
     IFS='|' read -ra uas <<< "$UA_STRING"
@@ -326,7 +382,11 @@ probe() {
     	location=$(echo "$response" | grep -i "^Location:" | head -1 | tr -d '\r' | awk '{print $2}')
    	[[ -n "$location" ]] && echo "$location"
     else
-    	parse_body "$body" | sort -u
+    	{ parse_body "$body"
+    	  if [[ "$url" =~ \.js([?#]|$) ]] || echo "$response" | grep -qiE '^content-type:.*javascript'; then
+    	  	parse_js "$body"
+    	  fi
+    	} | sort -u
     fi
 }
 export -f probe
@@ -364,6 +424,70 @@ crawl() {
 }
 
 # ---------------------------------------------------------------------------
+# WAYBACK — archived URLs, diffed against crawl, vital few live-probed
+# ---------------------------------------------------------------------------
+
+# Fetch archived URLs from Wayback CDX into WAYBACK_TMP.
+# Testbed shunt: recon.brutelogic.net reads a local wayback.txt that mimics
+# raw CDX, so the same parser runs in test and in production.
+wayback_fetch() {
+	local host cdx_url
+	host="${TARGET#http*://}"; host="${host%%/*}"
+	if [[ "$host" == "recon.brutelogic.net" ]]; then
+		cdx_url="${TARGET}/wayback.txt"
+	else
+		cdx_url="http://web.archive.org/cdx/search/cdx?url=${host}/*&filter=statuscode:200&limit=20000"
+	fi
+	curl -s --connect-timeout "$CONNECT_TIMEOUT" --max-time 15 \
+		-A "${UA_LIST[0]}" "$cdx_url" > "$WAYBACK_TMP"
+}
+
+# Diff archive against what crawl already found, keep the vital few (Pareto,
+# capped), live-probe only survivors. Archive-only + still live = the juice.
+wayback_diff() {
+	[[ -s "$WAYBACK_TMP" ]] || return
+	local -A CRAWL_SIGS NATIVE_PATHS SIG_COUNT SIG_URL
+	local u w line orig s survivors result status url
+
+	# signatures crawl already confirmed live (SEEN is URL-keyed; reduce to sigs)
+	for u in "${!SEEN[@]}"; do CRAWL_SIGS["$(sig "$u")"]=1; done
+	# native wordlist paths, for the empty-param subtract
+	for w in "${WORDLIST[@]}"; do NATIVE_PATHS["/${w%/}"]=1; done
+
+	# fold raw CDX rows (field 3 = original URL) into sig -> count, sig -> url
+	while IFS= read -r line; do
+		orig=$(echo "$line" | awk '{print $3}')
+		[[ "$orig" != http* ]] && continue
+		s=$(sig "$orig")
+		[[ "${CRAWL_SIGS[$s]+x}" ]] && continue            # crawl already has it
+		if [[ "$s" == *"::" ]]; then                       # empty-param -> native check
+			[[ "${NATIVE_PATHS[${s%::}]+x}" ]] && continue
+		fi
+		SIG_COUNT["$s"]=$(( ${SIG_COUNT["$s"]:-0} + 1 ))
+		[[ -z "${SIG_URL[$s]+x}" ]] && SIG_URL["$s"]="$orig"
+	done < "$WAYBACK_TMP"
+
+	[[ ${#SIG_COUNT[@]} -eq 0 ]] && return
+
+	survivors=$(for s in "${!SIG_COUNT[@]}"; do
+		printf '%s\t%s\n' "${SIG_COUNT[$s]}" "${SIG_URL[$s]}"
+	done | pareto_cut "$WAYBACK_CAP")
+	[[ -z "$survivors" ]] && return
+
+	while IFS= read -r url; do
+		[[ -z "$url" ]] && continue
+		result=$(probe "$url" | head -1)
+		[[ "$result" =~ ^[0-9]{3}\  ]] || continue
+		status="${result%% *}"; url="${result#* }"
+		[[ "$status" == "429" ]] && continue
+		[[ "${SEEN[$url]+x}" ]] && continue
+		SEEN["$url"]=1
+		RESULTS["$url"]="$status"
+		print_result "$url" "$status"
+	done <<< "$survivors"
+}
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -372,10 +496,14 @@ main() {
     START_TIME=$SECONDS
     $JSON_MODE || header
     preflight
+    wayback_fetch &                        # archive fetch overlaps crawl
+    local wb_pid=$!
     passive
     brute
     QUEUE=($(shuf -e "${QUEUE[@]}"))
     crawl
+    wait "$wb_pid" 2>/dev/null              # archive fetch must be done
+    wayback_diff
     local elapsed=$(( SECONDS - START_TIME ))
     if $JSON_MODE; then
         json_output

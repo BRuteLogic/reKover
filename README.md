@@ -12,11 +12,14 @@ Part of the **King of Noobs** suite — offensive recon tools built on KISS and 
 
 ## What It Does
 
-reKover discovers URLs on a target by combining three phases into one fast pipeline:
+reKover discovers URLs on a target by combining four phases into one fast pipeline:
 
 1. **Passive** — extracts paths from `robots.txt` and `sitemap.xml`
 2. **Brute** — probes a probability-weighted wordlist built as a L1→L2→L3 tree, covering the top 80% of paths found in real-world targets following the Pareto principle
-3. **Crawl** — follows links extracted from response bodies, recursively, until the queue is empty
+3. **Crawl** — follows links extracted from response bodies, recursively, until the queue is empty. Reads JavaScript too: relative API paths, `fetch`/`axios` arguments, and backtick template-literal endpoints that plain HTML extraction misses
+4. **Wayback** — pulls archived URLs from the Wayback CDX, diffs them against what the crawl already found, ranks the remainder by capture count and keeps the vital few (Pareto, hard-capped), then live-probes only those. Surfaces delinked endpoints, including parameterized ones, that still respond but are referenced nowhere on the live site
+
+Every phase feeds one live-probe pass, so output is confirmed URLs only. Archived paths that no longer respond are dropped.
 
 Results stream live as they're found. WAF detection via 429 responses — automatically switches to throttled mode.
 
