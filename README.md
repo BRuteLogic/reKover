@@ -70,7 +70,7 @@ Test reKover against a live target built specifically for this tool:
 
 **https://recon.brutelogic.net**
 
-195 URLs across status codes 200, 201, 301, 302, and 403.
+209 URLs across status codes 200, 201, 301, 302, and 403.
 
 ---
 

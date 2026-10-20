@@ -433,7 +433,7 @@ crawl() {
 wayback_fetch() {
 	local host cdx_url
 	host="${TARGET#http*://}"; host="${host%%/*}"
-	if [[ "$host" == "recon.brutelogic.net" ]]; then
+	if [[ "$host" == "recon.brutelogic.net" ]]; then   # testbed: serve local CDX mock, not live archive
 		cdx_url="${TARGET}/wayback.txt"
 	else
 		cdx_url="http://web.archive.org/cdx/search/cdx?url=${host}/*&filter=statuscode:200&limit=20000"
