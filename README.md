@@ -16,7 +16,7 @@ reKover discovers URLs on a target by combining four phases into one fast pipeli
 
 1. **Passive** — extracts paths from `robots.txt` and `sitemap.xml`
 2. **Brute** — probes a probability-weighted wordlist built as a L1→L2→L3 tree, covering the top 80% of paths found in real-world targets following the Pareto principle
-3. **Crawl** — follows links extracted from response bodies, recursively, until the queue is empty. Reads JavaScript too: relative API paths, `fetch`/`axios` arguments, and backtick template-literal endpoints that plain HTML extraction misses
+3. **Crawl** — follows links extracted from response bodies, recursively, until the queue is empty. Reads JavaScript too: relative API paths, `fetch`/`axios` arguments, and backtick template-literal endpoints that plain HTML extraction misses. Parameterized URLs collapse by signature: value variants fold into one endpoint, and path-parameter routes (same handler, varying slug) fold to a single representative confirmed by response similarity, then ranked by recurrence and capped
 4. **Wayback** — pulls archived URLs from the Wayback CDX, diffs them against what the crawl already found, ranks the remainder by capture count and keeps the vital few (Pareto, hard-capped), then live-probes only those. Surfaces delinked endpoints, including parameterized ones, that still respond but are referenced nowhere on the live site
 
 Every phase feeds one live-probe pass, so output is confirmed URLs only. Archived paths that no longer respond are dropped.
@@ -70,7 +70,7 @@ Test reKover against a live target built specifically for this tool:
 
 **https://recon.brutelogic.net**
 
-209 URLs across status codes 200, 201, 301, 302, and 403.
+212 unique URLs across status codes 200, 201, 301, 302, and 403.
 
 ---
 

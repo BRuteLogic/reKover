@@ -9,7 +9,7 @@
 # CONFIG & ARGUMENTS
 # ---------------------------------------------------------------------------
 
-TOOL="reKover v1.2 by Brute Logic - https://brutelogic.net"
+TOOL="reKover v1.3 by Brute Logic - https://brutelogic.net"
 TARGET=""
 JSON_MODE=false
 
@@ -32,6 +32,12 @@ WAF_TRIGGERED=false
 WAYBACK_CAP=50                 # max signatures kept per archive pass
 WAYBACK_TMP="$(mktemp)"        # archive fetch lands here (background job)
 trap 'rm -f "$WAYBACK_TMP"' EXIT
+
+# Param crawl
+CRAWL_CAP=50                 # max distinct param paths kept
+SIM_THRESHOLD=60             # body similarity % to collapse path-param siblings
+declare -A PARAM_COUNT       # sig -> recurrence count
+declare -A PARAM_URL         # sig -> example URL
 
 # Result storage
 declare -A RESULTS     # url → status code (all confirmed hits)
@@ -261,6 +267,23 @@ sig() {
 	printf '%s::%s\n' "$path" "$keys"
 }
 
+# Token-level similarity (0-100) of two response bodies, dep-free. Used to decide
+# whether path-param siblings are the same handler; tolerant of unique IDs/tokens.
+jaccard() {
+	local A B na nb common
+	A=$(printf '%s' "$1" | tr -c '[:alnum:]' '\n' | grep -v '^$' | sort -u)
+	B=$(printf '%s' "$2" | tr -c '[:alnum:]' '\n' | grep -v '^$' | sort -u)
+	na=$(printf '%s\n' "$A" | grep -c .)
+	nb=$(printf '%s\n' "$B" | grep -c .)
+	common=$(comm -12 <(printf '%s\n' "$A") <(printf '%s\n' "$B") | grep -c .)
+	awk -v c="$common" -v x="$na" -v y="$nb" 'BEGIN{ if(x+y==0){print 0}else{printf "%d",(200*c)/(x+y)} }'
+}
+
+# Fetch only the response body of a URL, for similarity sampling
+fetch_body() {
+	curl -s --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -A "$(random_ua)" "$1"
+}
+
 # Keep the vital few from weighted lines "count<TAB>payload" on stdin: walk the
 # ranking until cumulative count hits 80% of total, hard-capped at ceiling (arg 1)
 pareto_cut() {
@@ -413,6 +436,13 @@ crawl() {
         	[[ "$line" == http* ]] && full="$line" || full="${TARGET}${line}"
         	[[ "$full" != "$TARGET"* ]] && continue
     		[[ "$full" =~ \.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|mp4|mp3)(\?.*)?$ ]] && continue
+    		# param URL: collect by signature for param_diff, skip the crawl frontier
+    		if [[ "$full" == *\?* ]]; then
+    		    local s; s=$(sig "$full")
+    		    PARAM_COUNT["$s"]=$(( ${PARAM_COUNT["$s"]:-0} + 1 ))
+    		    [[ -z "${PARAM_URL[$s]+x}" ]] && PARAM_URL["$s"]="$full"
+    		    continue
+    		fi
                 [[ "${SEEN[$full]+x}" ]] && continue
 		[[ "${QUEUED[$full]+x}" ]] && continue
 		QUEUED["$full"]=1
@@ -474,17 +504,83 @@ wayback_diff() {
 	done | pareto_cut "$WAYBACK_CAP")
 	[[ -z "$survivors" ]] && return
 
-	while IFS= read -r url; do
-		[[ -z "$url" ]] && continue
-		result=$(probe "$url" | head -1)
-		[[ "$result" =~ ^[0-9]{3}\  ]] || continue
-		status="${result%% *}"; url="${result#* }"
+	# live-probe survivors in parallel (same pattern as crawl), record in parent
+	local -A IS_SURVIVOR
+	while IFS= read -r u; do [[ -n "$u" ]] && IS_SURVIVOR["$u"]=1; done <<< "$survivors"
+	while IFS= read -r line; do
+		[[ "$line" =~ ^[0-9]{3}\  ]] || continue
+		status="${line%% *}"; url="${line#* }"
+		[[ -z "${IS_SURVIVOR[$url]+x}" ]] && continue   # survivor status lines only
 		[[ "$status" == "429" ]] && continue
 		[[ "${SEEN[$url]+x}" ]] && continue
 		SEEN["$url"]=1
 		RESULTS["$url"]="$status"
 		print_result "$url" "$status"
-	done <<< "$survivors"
+	done < <(printf '%s\n' "$survivors" | grep -v '^$' | parallel -j "$PARALLEL_JOBS" probe {})
+}
+
+# ---------------------------------------------------------------------------
+# PARAM DIFF — crawl-collected param URLs: query-collapse, path-param collapse,
+# capped, live-probed. Output is real URLs only.
+# ---------------------------------------------------------------------------
+
+# Collapse collected param URLs twice: by path (heaviest query combo), then by
+# route (path-param siblings whose sampled bodies match by jaccard). Rank the
+# survivors by recurrence, keep the top CRAWL_CAP, live-probe them in parallel.
+param_diff() {
+	[[ ${#PARAM_COUNT[@]} -eq 0 ]] && return
+	local -A EP_WEIGHT EP_URL EP_BESTCNT GRP_MEMBERS FINAL_WEIGHT FINAL_URL IS_SURVIVOR
+	local -a members
+	local s p c keys parent gk b1 b2 sim best bw tot m survivors line status url
+
+	# 1) query-collapse: one endpoint per path, heaviest combo as representative
+	for s in "${!PARAM_COUNT[@]}"; do
+		p="${s%%::*}"; c=${PARAM_COUNT[$s]}
+		EP_WEIGHT["$p"]=$(( ${EP_WEIGHT["$p"]:-0} + c ))
+		if (( c > ${EP_BESTCNT["$p"]:-0} )); then EP_BESTCNT["$p"]=$c; EP_URL["$p"]="${PARAM_URL[$s]}"; fi
+	done
+
+	# 2) group endpoints by (parent path, param keys) to find path-param siblings
+	for p in "${!EP_WEIGHT[@]}"; do
+		s=$(sig "${EP_URL[$p]}"); keys="${s#*::}"; parent="${p%/*}"
+		GRP_MEMBERS["${parent}::${keys}"]+="$p"$'\n'
+	done
+
+	# 3) path-param collapse: sample 2 bodies per 2+ group; same handler
+	#    (jaccard >= SIM_THRESHOLD) keeps one real representative, else keep all
+	for gk in "${!GRP_MEMBERS[@]}"; do
+		mapfile -t members < <(printf '%s' "${GRP_MEMBERS[$gk]}" | grep -v '^$')
+		if (( ${#members[@]} >= 2 )); then
+			b1=$(fetch_body "${EP_URL[${members[0]}]}"); b2=$(fetch_body "${EP_URL[${members[1]}]}")
+			sim=$(jaccard "$b1" "$b2")
+			if (( sim >= SIM_THRESHOLD )); then
+				best=""; bw=-1; tot=0
+				for m in "${members[@]}"; do
+					tot=$(( tot + ${EP_WEIGHT[$m]} ))
+					(( ${EP_WEIGHT[$m]} > bw )) && { bw=${EP_WEIGHT[$m]}; best=$m; }
+				done
+				FINAL_WEIGHT["$best"]=$tot; FINAL_URL["$best"]="${EP_URL[$best]}"
+				continue
+			fi
+		fi
+		for m in "${members[@]}"; do FINAL_WEIGHT["$m"]=${EP_WEIGHT[$m]}; FINAL_URL["$m"]="${EP_URL[$m]}"; done
+	done
+
+	# 4) rank by recurrence, keep the top CRAWL_CAP
+	survivors=$(for p in "${!FINAL_URL[@]}"; do printf '%s\t%s\n' "${FINAL_WEIGHT[$p]}" "${FINAL_URL[$p]}"; done \
+		| sort -t$'\t' -k1,1 -nr | head -n "$CRAWL_CAP" | cut -f2)
+	[[ -z "$survivors" ]] && return
+	while IFS= read -r url; do [[ -n "$url" ]] && IS_SURVIVOR["$url"]=1; done <<< "$survivors"
+
+	# 5) live-probe survivors in parallel (same pattern as wayback_diff), record
+	while IFS= read -r line; do
+		[[ "$line" =~ ^[0-9]{3}\  ]] || continue
+		status="${line%% *}"; url="${line#* }"
+		[[ -z "${IS_SURVIVOR[$url]+x}" ]] && continue
+		[[ "$status" == "429" ]] && continue
+		[[ "${SEEN[$url]+x}" ]] && continue
+		SEEN["$url"]=1; RESULTS["$url"]="$status"; print_result "$url" "$status"
+	done < <(printf '%s\n' "$survivors" | grep -v '^$' | parallel -j "$PARALLEL_JOBS" probe {})
 }
 
 # ---------------------------------------------------------------------------
@@ -502,6 +598,7 @@ main() {
     brute
     QUEUE=($(shuf -e "${QUEUE[@]}"))
     crawl
+    param_diff                              # collapse + cap crawled param URLs
     wait "$wb_pid" 2>/dev/null              # archive fetch must be done
     wayback_diff
     local elapsed=$(( SECONDS - START_TIME ))
